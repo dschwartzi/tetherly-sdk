@@ -87,11 +87,17 @@ export class SignalingClient {
     }
     startPing() {
         this.stopPing();
+        // Ping every 15 seconds to keep connection alive
         this.pingInterval = setInterval(() => {
             if (this.ws?.readyState === WebSocket.OPEN) {
                 this.send({ type: 'ping' });
             }
-        }, 30000);
+            else {
+                // WebSocket not open - trigger reconnect
+                console.log('[SDK] Ping failed - WebSocket not open, reconnecting...');
+                this.scheduleReconnect();
+            }
+        }, 15000);
     }
     stopPing() {
         if (this.pingInterval) {

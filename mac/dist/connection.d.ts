@@ -21,6 +21,7 @@ export declare class Connection {
     private config;
     private pendingCandidates;
     private _isConnected;
+    private isConnecting;
     constructor(config: ConnectionConfig, events: TetherlyEvents);
     get isConnected(): boolean;
     connect(): Promise<void>;

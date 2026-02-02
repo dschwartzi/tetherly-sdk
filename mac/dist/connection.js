@@ -12,6 +12,7 @@ export class Connection {
     config;
     pendingCandidates = [];
     _isConnected = false;
+    isConnecting = false; // Prevent concurrent connection attempts
     constructor(config, events) {
         this.config = config;
         this.events = events;
@@ -73,10 +74,24 @@ export class Connection {
         }
     }
     async handlePeerJoined() {
+        // Prevent concurrent connection attempts
+        if (this.isConnecting) {
+            console.log('[SDK] Already connecting - ignoring peer-joined');
+            return;
+        }
         console.log('[SDK] Peer joined - creating offer');
-        this.close();
-        this.createPeerConnection();
-        await this.createOffer();
+        this.isConnecting = true;
+        try {
+            this.close();
+            this.createPeerConnection();
+            await this.createOffer();
+        }
+        catch (error) {
+            console.error('[SDK] Error in handlePeerJoined:', error);
+        }
+        finally {
+            this.isConnecting = false;
+        }
     }
     async handleOffer(payload) {
         console.log('[SDK] Received offer');
@@ -156,14 +171,22 @@ export class Connection {
         };
     }
     async createOffer() {
-        if (!this.peerConnection)
+        const pc = this.peerConnection;
+        if (!pc) {
+            console.log('[SDK] No peer connection for createOffer');
             return;
-        this.dataChannel = this.peerConnection.createDataChannel('tetherly', {
+        }
+        this.dataChannel = pc.createDataChannel('tetherly', {
             ordered: true,
         });
         this.setupDataChannel(this.dataChannel);
-        const offer = await this.peerConnection.createOffer();
-        await this.peerConnection.setLocalDescription(offer);
+        const offer = await pc.createOffer();
+        // Check again in case connection was closed during async operation
+        if (!this.peerConnection || this.peerConnection !== pc) {
+            console.log('[SDK] Peer connection changed during offer creation');
+            return;
+        }
+        await pc.setLocalDescription(offer);
         this.signaling.send({
             type: 'sdp-offer',
             payload: { sdp: offer.sdp },
@@ -203,9 +226,15 @@ export class Connection {
         };
     }
     close() {
-        this.dataChannel?.close();
+        try {
+            this.dataChannel?.close();
+        }
+        catch (e) { /* ignore */ }
         this.dataChannel = null;
-        this.peerConnection?.close();
+        try {
+            this.peerConnection?.close();
+        }
+        catch (e) { /* ignore */ }
         this.peerConnection = null;
         this._isConnected = false;
         this.pendingCandidates = [];

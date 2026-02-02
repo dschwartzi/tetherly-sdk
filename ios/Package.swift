@@ -14,13 +14,13 @@ let package = Package(
         ),
     ],
     dependencies: [
-        .package(url: "https://github.com/nickvido/WebRTC-build.git", from: "1.0.0"),
+        .package(url: "https://github.com/stasel/WebRTC.git", from: "125.0.0"),
     ],
     targets: [
         .target(
             name: "TetherlySDK",
             dependencies: [
-                .product(name: "WebRTC", package: "WebRTC-build"),
+                .product(name: "WebRTC", package: "WebRTC"),
             ],
             path: "Sources/TetherlySDK"
         ),

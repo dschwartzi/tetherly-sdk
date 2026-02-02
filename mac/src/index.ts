@@ -130,6 +130,19 @@ export class TetherlySDK {
 }
 
 // Re-export types
-export type { Message, MediaMessage, SyncRecord, SyncMessage, TetherlyEvents } from './types.js';
+export type { 
+  Message, 
+  MediaMessage, 
+  SyncRecord, 
+  SyncMessage, 
+  TetherlyEvents,
+  // Session data model
+  MessageRole,
+  MessageType,
+  ContentCategory,
+  MessageMetadata,
+  SessionMessage,
+  Session,
+} from './types.js';
 export { Connection } from './connection.js';
 export { TetherlySyncStore } from './sync-store.js';

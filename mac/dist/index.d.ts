@@ -35,6 +35,6 @@ export declare class TetherlySDK {
     syncDelete(collection: string, id: string): void;
     private isSyncMessage;
 }
-export type { Message, MediaMessage, SyncRecord, SyncMessage, TetherlyEvents } from './types.js';
+export type { Message, MediaMessage, SyncRecord, SyncMessage, TetherlyEvents, MessageRole, MessageType, ContentCategory, MessageMetadata, SessionMessage, Session, } from './types.js';
 export { Connection } from './connection.js';
 export { TetherlySyncStore } from './sync-store.js';

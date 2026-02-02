@@ -33,13 +33,15 @@ export class SignalingClient {
     this.stopPing();
     this.clearReconnect();
 
-    const fullUrl = `${this.signalingUrl}?pairingCode=${this.pairingCode}`;
+    const fullUrl = `${this.signalingUrl}?pairingCode=${this.pairingCode}&type=agent`;
 
     return new Promise((resolve, reject) => {
       this.ws = new WebSocket(fullUrl);
 
       this.ws.on('open', () => {
         this.isConnecting = false;
+        // Send ready message - required by signaling server before it forwards peer notifications
+        this.send({ type: 'ready' });
         this.events.onConnected();
         this.startPing();
         resolve();

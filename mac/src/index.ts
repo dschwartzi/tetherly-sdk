@@ -13,6 +13,9 @@ export interface TetherlySDKConfig {
   pairingCode: string;
   storePath?: string;
   iceServers?: Array<{ urls: string | string[]; username?: string; credential?: string }>;
+  // Cloudflare TURN credentials (recommended for mobile network support)
+  cloudflareTurnTokenId?: string;
+  cloudflareTurnApiToken?: string;
 }
 
 export class TetherlySDK {
@@ -33,6 +36,8 @@ export class TetherlySDK {
         signalingUrl: config.signalingUrl,
         pairingCode: config.pairingCode,
         iceServers: config.iceServers,
+        cloudflareTurnTokenId: config.cloudflareTurnTokenId,
+        cloudflareTurnApiToken: config.cloudflareTurnApiToken,
       },
       {
         onConnected: () => {

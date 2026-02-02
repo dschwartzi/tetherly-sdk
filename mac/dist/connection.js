@@ -4,6 +4,46 @@
  */
 import { RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, } from 'werift';
 import { SignalingClient } from './signaling.js';
+// STUN servers (fast, for local network)
+const STUN_SERVERS = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+];
+// Fetch Cloudflare TURN credentials (they expire, so fetch fresh)
+async function fetchCloudflareTurnServers(tokenId, apiToken) {
+    if (!tokenId || !apiToken) {
+        console.log('[SDK] No Cloudflare TURN credentials - mobile connections may fail');
+        return [];
+    }
+    try {
+        const response = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${tokenId}/credentials/generate`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${apiToken}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ ttl: 86400 }), // 24 hour TTL
+        });
+        if (!response.ok) {
+            console.error(`[SDK] Cloudflare TURN API error: ${response.status}`);
+            return [];
+        }
+        const data = await response.json();
+        if (data.iceServers && data.iceServers.urls) {
+            console.log(`[SDK] Got ${data.iceServers.urls.length} Cloudflare TURN URLs`);
+            return data.iceServers.urls.map(url => ({
+                urls: url,
+                username: data.iceServers.username,
+                credential: data.iceServers.credential,
+            }));
+        }
+    }
+    catch (error) {
+        console.error(`[SDK] Failed to fetch Cloudflare TURN: ${error}`);
+    }
+    return [];
+}
 export class Connection {
     signaling;
     peerConnection = null;
@@ -13,6 +53,8 @@ export class Connection {
     pendingCandidates = [];
     _isConnected = false;
     isConnecting = false; // Prevent concurrent connection attempts
+    iceServers = STUN_SERVERS;
+    turnRefreshInterval = null;
     constructor(config, events) {
         this.config = config;
         this.events = events;
@@ -26,9 +68,32 @@ export class Connection {
         return this._isConnected;
     }
     async connect() {
+        // Fetch Cloudflare TURN servers if credentials provided
+        if (this.config.cloudflareTurnTokenId && this.config.cloudflareTurnApiToken) {
+            await this.refreshTurnServers();
+            // Refresh TURN credentials every 12 hours (they expire after 24h)
+            this.turnRefreshInterval = setInterval(async () => {
+                console.log('[SDK] Refreshing TURN credentials...');
+                await this.refreshTurnServers();
+            }, 12 * 60 * 60 * 1000);
+        }
+        else {
+            console.log('[SDK] No Cloudflare TURN configured - using STUN only');
+        }
         await this.signaling.connect();
     }
+    async refreshTurnServers() {
+        const turnServers = await fetchCloudflareTurnServers(this.config.cloudflareTurnTokenId, this.config.cloudflareTurnApiToken);
+        if (turnServers.length > 0) {
+            this.iceServers = [...STUN_SERVERS, ...turnServers];
+            console.log(`[SDK] ICE servers: ${this.iceServers.length} total (${turnServers.length} TURN)`);
+        }
+    }
     disconnect() {
+        if (this.turnRefreshInterval) {
+            clearInterval(this.turnRefreshInterval);
+            this.turnRefreshInterval = null;
+        }
         this.close();
         this.signaling.disconnect();
     }
@@ -134,29 +199,12 @@ export class Connection {
         }
     }
     createPeerConnection() {
-        // Default ICE servers: STUN + free TURN relay for mobile network support
-        const defaultIceServers = [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' },
-            // Free TURN servers from Open Relay Project (https://www.metered.ca/tools/openrelay/)
-            {
-                urls: 'turn:openrelay.metered.ca:80',
-                username: 'openrelayproject',
-                credential: 'openrelayproject',
-            },
-            {
-                urls: 'turn:openrelay.metered.ca:443',
-                username: 'openrelayproject',
-                credential: 'openrelayproject',
-            },
-            {
-                urls: 'turn:openrelay.metered.ca:443?transport=tcp',
-                username: 'openrelayproject',
-                credential: 'openrelayproject',
-            },
-        ];
-        const iceServers = this.config.iceServers || defaultIceServers;
-        console.log(`[SDK] Using ${iceServers.length} ICE servers (${iceServers.filter(s => String(s.urls).includes('turn')).length} TURN)`);
+        const iceServers = this.config.iceServers || this.iceServers;
+        const turnCount = iceServers.filter(s => String(s.urls).includes('turn')).length;
+        console.log(`[SDK] Using ${iceServers.length} ICE servers (${turnCount} TURN)`);
+        if (turnCount === 0) {
+            console.warn('[SDK] WARNING: No TURN servers - mobile connections will likely fail!');
+        }
         this.peerConnection = new RTCPeerConnection({
             iceServers: iceServers,
         });

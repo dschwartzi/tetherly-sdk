@@ -14,6 +14,8 @@ export interface TetherlySDKConfig {
         username?: string;
         credential?: string;
     }>;
+    cloudflareTurnTokenId?: string;
+    cloudflareTurnApiToken?: string;
 }
 export declare class TetherlySDK {
     private connection;

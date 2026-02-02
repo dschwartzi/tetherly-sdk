@@ -19,6 +19,8 @@ export class TetherlySDK {
             signalingUrl: config.signalingUrl,
             pairingCode: config.pairingCode,
             iceServers: config.iceServers,
+            cloudflareTurnTokenId: config.cloudflareTurnTokenId,
+            cloudflareTurnApiToken: config.cloudflareTurnApiToken,
         }, {
             onConnected: () => {
                 console.log('[SDK] Connected');

@@ -55,6 +55,10 @@ export class Connection {
     isConnecting = false; // Prevent concurrent connection attempts
     iceServers = STUN_SERVERS;
     turnRefreshInterval = null;
+    healthCheckInterval = null;
+    lastPeerActivity = Date.now();
+    static HEALTH_CHECK_INTERVAL_MS = 10000; // Check every 10s
+    static PEER_TIMEOUT_MS = 60000; // Consider dead after 60s no activity
     constructor(config, events) {
         this.config = config;
         this.events = events;
@@ -80,7 +84,34 @@ export class Connection {
         else {
             console.log('[SDK] No Cloudflare TURN configured - using STUN only');
         }
+        // Start health check loop
+        this.startHealthCheck();
         await this.signaling.connect();
+    }
+    startHealthCheck() {
+        if (this.healthCheckInterval)
+            return;
+        this.healthCheckInterval = setInterval(() => {
+            // Check signaling health
+            if (!this.signaling.isConnected) {
+                console.log('[SDK] Health check: signaling down, reconnecting...');
+                this.signaling.connect().catch(e => console.error('[SDK] Reconnect failed:', e));
+                return;
+            }
+            // Check if peer connection is stale (no activity for too long)
+            if (this._isConnected) {
+                const timeSinceActivity = Date.now() - this.lastPeerActivity;
+                if (timeSinceActivity > Connection.PEER_TIMEOUT_MS) {
+                    console.log(`[SDK] Health check: peer stale (${Math.round(timeSinceActivity / 1000)}s), resetting...`);
+                    this.close();
+                    // Signaling will trigger new peer-joined when iOS reconnects
+                }
+            }
+        }, Connection.HEALTH_CHECK_INTERVAL_MS);
+    }
+    // Call this whenever we receive data from peer
+    markPeerActivity() {
+        this.lastPeerActivity = Date.now();
     }
     async refreshTurnServers() {
         const turnServers = await fetchCloudflareTurnServers(this.config.cloudflareTurnTokenId, this.config.cloudflareTurnApiToken);
@@ -93,6 +124,10 @@ export class Connection {
         if (this.turnRefreshInterval) {
             clearInterval(this.turnRefreshInterval);
             this.turnRefreshInterval = null;
+        }
+        if (this.healthCheckInterval) {
+            clearInterval(this.healthCheckInterval);
+            this.healthCheckInterval = null;
         }
         this.close();
         this.signaling.disconnect();
@@ -275,6 +310,8 @@ export class Connection {
             }
         };
         channel.onmessage = (event) => {
+            // Mark activity for health check
+            this.markPeerActivity();
             const data = typeof event.data === 'string'
                 ? event.data
                 : event.data.toString('utf-8');

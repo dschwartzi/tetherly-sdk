@@ -26,9 +26,15 @@ export declare class Connection {
     private isConnecting;
     private iceServers;
     private turnRefreshInterval;
+    private healthCheckInterval;
+    private lastPeerActivity;
+    private static readonly HEALTH_CHECK_INTERVAL_MS;
+    private static readonly PEER_TIMEOUT_MS;
     constructor(config: ConnectionConfig, events: TetherlyEvents);
     get isConnected(): boolean;
     connect(): Promise<void>;
+    private startHealthCheck;
+    private markPeerActivity;
     private refreshTurnServers;
     disconnect(): void;
     send(message: Message): void;

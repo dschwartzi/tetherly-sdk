@@ -10,11 +10,21 @@ export class SignalingClient {
     events;
     reconnectTimeout = null;
     pingInterval = null;
-    isConnecting = false;
+    _isConnecting = false;
+    _isConnected = false;
     constructor(signalingUrl, pairingCode, events) {
         this.signalingUrl = signalingUrl;
         this.pairingCode = pairingCode;
         this.events = events;
+    }
+    get isConnected() {
+        return this._isConnected;
+    }
+    get isConnecting() {
+        return this._isConnecting;
+    }
+    set isConnecting(value) {
+        this._isConnecting = value;
     }
     connect() {
         if (this.isConnecting)
@@ -27,6 +37,7 @@ export class SignalingClient {
             this.ws = new WebSocket(fullUrl);
             this.ws.on('open', () => {
                 this.isConnecting = false;
+                this._isConnected = true;
                 // Send ready message - required by signaling server before it forwards peer notifications
                 this.send({ type: 'ready' });
                 this.events.onConnected();
@@ -49,12 +60,14 @@ export class SignalingClient {
             });
             this.ws.on('close', () => {
                 this.isConnecting = false;
+                this._isConnected = false;
                 this.events.onDisconnected();
                 this.scheduleReconnect();
             });
             this.ws.on('error', (error) => {
                 console.error('[SDK] Signaling error:', error.message);
                 this.isConnecting = false;
+                this._isConnected = false;
                 this.ws?.close();
                 reject(error);
             });

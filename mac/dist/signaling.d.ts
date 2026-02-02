@@ -14,8 +14,12 @@ export declare class SignalingClient {
     private events;
     private reconnectTimeout;
     private pingInterval;
-    private isConnecting;
+    private _isConnecting;
+    private _isConnected;
     constructor(signalingUrl: string, pairingCode: string, events: SignalingEvents);
+    get isConnected(): boolean;
+    private get isConnecting();
+    private set isConnecting(value);
     connect(): Promise<void>;
     disconnect(): void;
     send(message: unknown): void;

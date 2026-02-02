@@ -84,6 +84,10 @@ export class Connection {
   private isConnecting = false;  // Prevent concurrent connection attempts
   private iceServers: RTCIceServer[] = STUN_SERVERS;
   private turnRefreshInterval: NodeJS.Timeout | null = null;
+  private healthCheckInterval: NodeJS.Timeout | null = null;
+  private lastPeerActivity = Date.now();
+  private static readonly HEALTH_CHECK_INTERVAL_MS = 10000;  // Check every 10s
+  private static readonly PEER_TIMEOUT_MS = 60000;  // Consider dead after 60s no activity
 
   constructor(config: ConnectionConfig, events: TetherlyEvents) {
     this.config = config;
@@ -118,7 +122,38 @@ export class Connection {
       console.log('[SDK] No Cloudflare TURN configured - using STUN only');
     }
     
+    // Start health check loop
+    this.startHealthCheck();
+    
     await this.signaling.connect();
+  }
+  
+  private startHealthCheck(): void {
+    if (this.healthCheckInterval) return;
+    
+    this.healthCheckInterval = setInterval(() => {
+      // Check signaling health
+      if (!this.signaling.isConnected) {
+        console.log('[SDK] Health check: signaling down, reconnecting...');
+        this.signaling.connect().catch(e => console.error('[SDK] Reconnect failed:', e));
+        return;
+      }
+      
+      // Check if peer connection is stale (no activity for too long)
+      if (this._isConnected) {
+        const timeSinceActivity = Date.now() - this.lastPeerActivity;
+        if (timeSinceActivity > Connection.PEER_TIMEOUT_MS) {
+          console.log(`[SDK] Health check: peer stale (${Math.round(timeSinceActivity/1000)}s), resetting...`);
+          this.close();
+          // Signaling will trigger new peer-joined when iOS reconnects
+        }
+      }
+    }, Connection.HEALTH_CHECK_INTERVAL_MS);
+  }
+  
+  // Call this whenever we receive data from peer
+  private markPeerActivity(): void {
+    this.lastPeerActivity = Date.now();
   }
   
   private async refreshTurnServers(): Promise<void> {
@@ -136,6 +171,10 @@ export class Connection {
     if (this.turnRefreshInterval) {
       clearInterval(this.turnRefreshInterval);
       this.turnRefreshInterval = null;
+    }
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
+      this.healthCheckInterval = null;
     }
     this.close();
     this.signaling.disconnect();
@@ -342,6 +381,9 @@ export class Connection {
     };
 
     channel.onmessage = (event: { data: string | Buffer }) => {
+      // Mark activity for health check
+      this.markPeerActivity();
+      
       const data = typeof event.data === 'string'
         ? event.data
         : event.data.toString('utf-8');

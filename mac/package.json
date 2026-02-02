@@ -1,0 +1,21 @@
+{
+  "name": "@tetherly/sdk-mac",
+  "version": "1.0.0",
+  "description": "Tetherly SDK for Mac - WebRTC connection and sync",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "werift": "^0.19.4",
+    "ws": "^8.14.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.3.2"
+  }
+}

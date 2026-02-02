@@ -173,9 +173,30 @@ export class Connection {
   }
 
   private createPeerConnection(): void {
-    const iceServers = this.config.iceServers || [
+    // Default ICE servers: STUN + free TURN relay for mobile network support
+    const defaultIceServers: RTCIceServer[] = [
       { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      // Free TURN servers from Open Relay Project (https://www.metered.ca/tools/openrelay/)
+      {
+        urls: 'turn:openrelay.metered.ca:80',
+        username: 'openrelayproject',
+        credential: 'openrelayproject',
+      },
+      {
+        urls: 'turn:openrelay.metered.ca:443',
+        username: 'openrelayproject',
+        credential: 'openrelayproject',
+      },
+      {
+        urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+        username: 'openrelayproject',
+        credential: 'openrelayproject',
+      },
     ];
+    
+    const iceServers = this.config.iceServers || defaultIceServers;
+    console.log(`[SDK] Using ${iceServers.length} ICE servers (${iceServers.filter(s => String(s.urls).includes('turn')).length} TURN)`);
 
     this.peerConnection = new RTCPeerConnection({
       iceServers: iceServers as any,

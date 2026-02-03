@@ -87,7 +87,7 @@ export class Connection {
   private healthCheckInterval: NodeJS.Timeout | null = null;
   private lastPeerActivity = Date.now();
   private static readonly HEALTH_CHECK_INTERVAL_MS = 5000;  // Check every 5s
-  private static readonly PEER_TIMEOUT_MS = 15000;  // Consider dead after 15s no activity
+  private static readonly PEER_TIMEOUT_MS = 30000;  // Consider dead after 30s no activity
 
   constructor(config: ConnectionConfig, events: TetherlyEvents) {
     this.config = config;

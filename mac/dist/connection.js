@@ -56,9 +56,13 @@ export class Connection {
     iceServers = STUN_SERVERS;
     turnRefreshInterval = null;
     healthCheckInterval = null;
+    connectionTimeout = null;
     lastPeerActivity = Date.now();
+    isResetting = false;
+    lastTurnServers = [];
     static HEALTH_CHECK_INTERVAL_MS = 10000; // Check every 10s
-    static PEER_TIMEOUT_MS = 60000; // Consider dead after 60s no activity
+    static PEER_TIMEOUT_MS = 120000; // Consider dead after 2 min no activity
+    static CONNECTION_TIMEOUT_MS = 30000; // 30s to establish connection
     constructor(config, events) {
         this.config = config;
         this.events = events;
@@ -70,6 +74,13 @@ export class Connection {
     }
     get isConnected() {
         return this._isConnected;
+    }
+    get isSignalingConnected() {
+        return this.signaling.isConnected;
+    }
+    // Get the last fetched TURN servers (for sending to iOS)
+    getLastTurnServers() {
+        return this.lastTurnServers;
     }
     async connect() {
         // Fetch Cloudflare TURN servers if credentials provided
@@ -117,7 +128,16 @@ export class Connection {
         const turnServers = await fetchCloudflareTurnServers(this.config.cloudflareTurnTokenId, this.config.cloudflareTurnApiToken);
         if (turnServers.length > 0) {
             this.iceServers = [...STUN_SERVERS, ...turnServers];
+            // Store for sending to iOS
+            this.lastTurnServers = turnServers.map(s => ({
+                urls: s.urls,
+                username: s.username || '',
+                credential: s.credential || '',
+            }));
             console.log(`[SDK] ICE servers: ${this.iceServers.length} total (${turnServers.length} TURN)`);
+        }
+        else {
+            this.lastTurnServers = [];
         }
     }
     disconnect() {
@@ -184,6 +204,7 @@ export class Connection {
         try {
             this.close();
             this.createPeerConnection();
+            this.startConnectionTimeout();
             await this.createOffer();
         }
         catch (error) {
@@ -192,6 +213,32 @@ export class Connection {
         finally {
             this.isConnecting = false;
         }
+    }
+    startConnectionTimeout() {
+        this.clearConnectionTimeout();
+        this.connectionTimeout = setTimeout(() => {
+            if (!this._isConnected && this.peerConnection) {
+                console.log('[SDK] Connection timeout - resetting for retry');
+                this.safeReset();
+            }
+        }, Connection.CONNECTION_TIMEOUT_MS);
+    }
+    clearConnectionTimeout() {
+        if (this.connectionTimeout) {
+            clearTimeout(this.connectionTimeout);
+            this.connectionTimeout = null;
+        }
+    }
+    safeReset() {
+        if (this.isResetting) {
+            console.log('[SDK] Reset already in progress, skipping');
+            return;
+        }
+        this.isResetting = true;
+        this.close();
+        setTimeout(() => {
+            this.isResetting = false;
+        }, 1000);
     }
     async handleOffer(payload) {
         console.log('[SDK] Received offer');
@@ -299,7 +346,9 @@ export class Connection {
         this.dataChannel = channel;
         channel.onopen = () => {
             console.log('[SDK] Data channel open');
+            this.clearConnectionTimeout();
             this._isConnected = true;
+            this.isResetting = false;
             this.events.onConnected?.();
         };
         channel.onclose = () => {
@@ -331,6 +380,7 @@ export class Connection {
         };
     }
     close() {
+        this.clearConnectionTimeout();
         try {
             this.dataChannel?.close();
         }

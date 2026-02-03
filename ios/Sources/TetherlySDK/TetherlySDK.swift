@@ -7,6 +7,7 @@ public class TetherlySDK: NSObject {
     
     public weak var delegate: TetherlySDKDelegate?
     public private(set) var isConnected = false
+    public private(set) var isSignalingConnected = false
     
     private let signalingUrl: String
     private let pairingCode: String
@@ -17,6 +18,10 @@ public class TetherlySDK: NSObject {
     
     private var pendingCandidates: [RTCIceCandidate] = []
     private var isInitiator = false
+    private var iceServers: [RTCIceServer] = []
+    private var connectionTimeout: Timer?
+    private var isResetting = false
+    private static let connectionTimeoutSeconds: TimeInterval = 30.0
     
     private static let factory: RTCPeerConnectionFactory = {
         RTCInitializeSSL()
@@ -27,10 +32,17 @@ public class TetherlySDK: NSObject {
     
     // MARK: - Initialization
     
-    public init(signalingUrl: String, pairingCode: String, storePath: URL? = nil) {
+    public init(signalingUrl: String, pairingCode: String, storePath: URL? = nil, iceServers: [RTCIceServer]? = nil) {
         self.signalingUrl = signalingUrl
         self.pairingCode = pairingCode
         self.syncStore = TetherlySyncStore(storePath: storePath)
+        
+        // Default to Google STUN if no servers provided
+        self.iceServers = iceServers ?? [
+            RTCIceServer(urlStrings: ["stun:stun.l.google.com:19302"]),
+            RTCIceServer(urlStrings: ["stun:stun1.l.google.com:19302"]),
+        ]
+        
         super.init()
         
         syncStore.setSyncHandler { [weak self] message in
@@ -43,6 +55,30 @@ public class TetherlySDK: NSObject {
         }
     }
     
+    // MARK: - ICE Server Configuration
+    
+    /// Update ICE servers (call before connect, or will take effect on next connection)
+    public func setIceServers(_ servers: [RTCIceServer]) {
+        self.iceServers = servers
+        print("[SDK] ICE servers updated: \(servers.count) servers")
+    }
+    
+    /// Add TURN servers received from Mac daemon
+    public func addTurnServers(_ turnServers: [[String: String]]) {
+        for server in turnServers {
+            if let urls = server["urls"],
+               let username = server["username"],
+               let credential = server["credential"] {
+                iceServers.append(RTCIceServer(
+                    urlStrings: [urls],
+                    username: username,
+                    credential: credential
+                ))
+            }
+        }
+        print("[SDK] Added \(turnServers.count) TURN servers")
+    }
+    
     // MARK: - Connection
     
     public func connect() {
@@ -50,9 +86,11 @@ public class TetherlySDK: NSObject {
     }
     
     public func disconnect() {
+        clearConnectionTimeout()
         cleanupPeerConnection()
         signalingConnection?.cancel(with: .goingAway, reason: nil)
         signalingConnection = nil
+        isSignalingConnected = false
     }
     
     // MARK: - Messaging
@@ -187,10 +225,49 @@ public class TetherlySDK: NSObject {
     
     private func createPeerConnection() {
         let config = RTCConfiguration()
-        config.iceServers = [RTCIceServer(urlStrings: ["stun:stun.l.google.com:19302"])]
+        config.iceServers = iceServers
+        config.sdpSemantics = .unifiedPlan
+        config.continualGatheringPolicy = .gatherContinually
+        
+        let turnCount = iceServers.filter { server in
+            server.urlStrings.contains { $0.contains("turn") }
+        }.count
+        print("[SDK] Creating peer connection with \(iceServers.count) ICE servers (\(turnCount) TURN)")
+        
+        if turnCount == 0 {
+            print("[SDK] WARNING: No TURN servers - mobile connections may fail!")
+        }
         
         let constraints = RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
         peerConnection = Self.factory.peerConnection(with: config, constraints: constraints, delegate: self)
+        
+        startConnectionTimeout()
+    }
+    
+    private func startConnectionTimeout() {
+        clearConnectionTimeout()
+        connectionTimeout = Timer.scheduledTimer(withTimeInterval: Self.connectionTimeoutSeconds, repeats: false) { [weak self] _ in
+            guard let self = self, !self.isConnected, self.peerConnection != nil else { return }
+            print("[SDK] Connection timeout - resetting for retry")
+            self.safeReset()
+        }
+    }
+    
+    private func clearConnectionTimeout() {
+        connectionTimeout?.invalidate()
+        connectionTimeout = nil
+    }
+    
+    private func safeReset() {
+        guard !isResetting else {
+            print("[SDK] Reset already in progress, skipping")
+            return
+        }
+        isResetting = true
+        cleanupPeerConnection()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.isResetting = false
+        }
     }
     
     private func handleOffer(sdp: String) {
@@ -260,6 +337,7 @@ public class TetherlySDK: NSObject {
     }
     
     private func cleanupPeerConnection() {
+        clearConnectionTimeout()
         dataChannel?.close()
         dataChannel = nil
         peerConnection?.close()

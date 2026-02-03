@@ -85,9 +85,13 @@ export class Connection {
   private iceServers: RTCIceServer[] = STUN_SERVERS;
   private turnRefreshInterval: NodeJS.Timeout | null = null;
   private healthCheckInterval: NodeJS.Timeout | null = null;
+  private connectionTimeout: NodeJS.Timeout | null = null;
   private lastPeerActivity = Date.now();
+  private isResetting = false;
+  private lastTurnServers: { urls: string; username: string; credential: string }[] = [];
   private static readonly HEALTH_CHECK_INTERVAL_MS = 10000;  // Check every 10s
   private static readonly PEER_TIMEOUT_MS = 120000;  // Consider dead after 2 min no activity
+  private static readonly CONNECTION_TIMEOUT_MS = 30000;  // 30s to establish connection
 
   constructor(config: ConnectionConfig, events: TetherlyEvents) {
     this.config = config;
@@ -106,6 +110,15 @@ export class Connection {
 
   get isConnected(): boolean {
     return this._isConnected;
+  }
+
+  get isSignalingConnected(): boolean {
+    return this.signaling.isConnected;
+  }
+
+  // Get the last fetched TURN servers (for sending to iOS)
+  getLastTurnServers(): { urls: string; username: string; credential: string }[] {
+    return this.lastTurnServers;
   }
 
   async connect(): Promise<void> {
@@ -163,7 +176,15 @@ export class Connection {
     );
     if (turnServers.length > 0) {
       this.iceServers = [...STUN_SERVERS, ...turnServers];
+      // Store for sending to iOS
+      this.lastTurnServers = turnServers.map(s => ({
+        urls: s.urls as string,
+        username: s.username || '',
+        credential: s.credential || '',
+      }));
       console.log(`[SDK] ICE servers: ${this.iceServers.length} total (${turnServers.length} TURN)`);
+    } else {
+      this.lastTurnServers = [];
     }
   }
 
@@ -237,12 +258,42 @@ export class Connection {
     try {
       this.close();
       this.createPeerConnection();
+      this.startConnectionTimeout();
       await this.createOffer();
     } catch (error) {
       console.error('[SDK] Error in handlePeerJoined:', error);
     } finally {
       this.isConnecting = false;
     }
+  }
+
+  private startConnectionTimeout(): void {
+    this.clearConnectionTimeout();
+    this.connectionTimeout = setTimeout(() => {
+      if (!this._isConnected && this.peerConnection) {
+        console.log('[SDK] Connection timeout - resetting for retry');
+        this.safeReset();
+      }
+    }, Connection.CONNECTION_TIMEOUT_MS);
+  }
+
+  private clearConnectionTimeout(): void {
+    if (this.connectionTimeout) {
+      clearTimeout(this.connectionTimeout);
+      this.connectionTimeout = null;
+    }
+  }
+
+  private safeReset(): void {
+    if (this.isResetting) {
+      console.log('[SDK] Reset already in progress, skipping');
+      return;
+    }
+    this.isResetting = true;
+    this.close();
+    setTimeout(() => {
+      this.isResetting = false;
+    }, 1000);
   }
 
   private async handleOffer(payload: { sdp: string }): Promise<void> {
@@ -368,7 +419,9 @@ export class Connection {
 
     channel.onopen = () => {
       console.log('[SDK] Data channel open');
+      this.clearConnectionTimeout();
       this._isConnected = true;
+      this.isResetting = false;
       this.events.onConnected?.();
     };
 
@@ -403,6 +456,8 @@ export class Connection {
   }
 
   private close(): void {
+    this.clearConnectionTimeout();
+    
     try {
       this.dataChannel?.close();
     } catch (e) { /* ignore */ }

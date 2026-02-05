@@ -166,6 +166,7 @@ export class Connection {
         }
     }
     async handleSignaling(type, payload) {
+        console.log(`[SDK] handleSignaling: ${type}`);
         try {
             switch (type) {
                 case 'peer-joined':

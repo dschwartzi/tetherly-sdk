@@ -290,7 +290,11 @@ public class TetherlySDK: NSObject {
 
     private func sendSignalingMessage(_ message: [String: Any]) {
         guard let data = try? JSONSerialization.data(withJSONObject: message),
-              let string = String(data: data, encoding: .utf8) else { return }
+              let string = String(data: data, encoding: .utf8) else { 
+            NSLog("[TetherlySDK] ERROR: Failed to serialize signaling message")
+            return 
+        }
+        NSLog("[TetherlySDK] Sending signaling message: \(message["type"] ?? "unknown")")
         signalingConnection?.send(.string(string)) { error in
             if let error = error {
                 print("[TetherlySDK] Failed to send signaling: \(error)")

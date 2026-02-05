@@ -115,6 +115,7 @@ public class TetherlySDK: NSObject {
     // MARK: - Connection
 
     public func connect() {
+        NSLog("[TetherlySDK] connect() called - signalingUrl: \(signalingUrl), pairingCode: \(pairingCode.prefix(20))...")
         connectToSignaling()
     }
 
@@ -387,6 +388,13 @@ public class TetherlySDK: NSObject {
     }
     
     private func handleOffer(sdp: String) {
+        // If we already have a local description (we created an offer), ignore incoming offers
+        // This handles race conditions where both sides try to create offers
+        if peerConnection?.localDescription != nil {
+            print("[TetherlySDK] Ignoring incoming offer - we already have local description (we are initiator)")
+            return
+        }
+        
         if peerConnection == nil {
             createPeerConnection()
         }

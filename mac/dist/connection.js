@@ -173,7 +173,10 @@ export class Connection {
                         console.log('[SDK] Ignoring peer-joined - already connected');
                         return;
                     }
-                    await this.handlePeerJoined();
+                    // Check if we're the initiator (signaling server sends isInitiator based on peer type)
+                    const peerPayload = payload;
+                    const isInitiator = peerPayload?.isInitiator ?? false;
+                    await this.handlePeerJoined(isInitiator);
                     break;
                 case 'peer-left':
                     this.close();
@@ -193,19 +196,43 @@ export class Connection {
             console.error('[SDK] Signaling error:', error);
         }
     }
-    async handlePeerJoined() {
+    async handlePeerJoined(isInitiator) {
         // Prevent concurrent connection attempts
         if (this.isConnecting) {
             console.log('[SDK] Already connecting - ignoring peer-joined');
             return;
         }
-        console.log('[SDK] Peer joined - creating offer');
+        console.log(`[SDK] Peer joined, isInitiator: ${isInitiator}`);
         this.isConnecting = true;
         try {
+            // Send TURN servers to iOS so it can use them too
+            if (this.iceServers.length > 0) {
+                const turnServers = this.iceServers
+                    .filter(s => String(s.urls).includes('turn'))
+                    .map(s => ({
+                    urls: s.urls,
+                    username: s.username,
+                    credential: s.credential,
+                }));
+                if (turnServers.length > 0) {
+                    console.log(`[SDK] Sending ${turnServers.length} TURN servers to iOS`);
+                    this.signaling.send({
+                        type: 'turn-config',
+                        payload: { servers: turnServers },
+                    });
+                }
+            }
             this.close();
             this.createPeerConnection();
             this.startConnectionTimeout();
-            await this.createOffer();
+            // Only create offer if we're the initiator
+            if (isInitiator) {
+                console.log('[SDK] Creating offer (we are initiator)');
+                await this.createOffer();
+            }
+            else {
+                console.log('[SDK] Waiting for offer (peer is initiator)');
+            }
         }
         catch (error) {
             console.error('[SDK] Error in handlePeerJoined:', error);
@@ -259,13 +286,23 @@ export class Connection {
     }
     async handleAnswer(payload) {
         console.log('[SDK] Received answer');
-        if (!this.peerConnection)
+        if (!this.peerConnection) {
+            console.log('[SDK] ERROR: No peer connection for answer');
             return;
-        await this.peerConnection.setRemoteDescription(new RTCSessionDescription(payload.sdp, 'answer'));
-        for (const candidate of this.pendingCandidates) {
-            await this.peerConnection.addIceCandidate(candidate);
         }
-        this.pendingCandidates = [];
+        try {
+            console.log('[SDK] Setting remote description (answer)...');
+            await this.peerConnection.setRemoteDescription(new RTCSessionDescription(payload.sdp, 'answer'));
+            console.log('[SDK] Remote description set successfully');
+            console.log(`[SDK] Adding ${this.pendingCandidates.length} pending ICE candidates`);
+            for (const candidate of this.pendingCandidates) {
+                await this.peerConnection.addIceCandidate(candidate);
+            }
+            this.pendingCandidates = [];
+        }
+        catch (error) {
+            console.error('[SDK] Error setting remote description:', error);
+        }
     }
     async handleIceCandidate(payload) {
         const candidate = new RTCIceCandidate({
@@ -292,6 +329,7 @@ export class Connection {
         });
         this.peerConnection.onIceCandidate.subscribe((candidate) => {
             if (candidate) {
+                console.log(`[SDK] Sending ICE candidate: ${candidate.candidate.substring(0, 50)}...`);
                 this.signaling.send({
                     type: 'ice-candidate',
                     payload: {

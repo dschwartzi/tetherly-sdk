@@ -12,6 +12,7 @@ public class TetherlySDK: NSObject {
     private let signalingUrl: String
     private let pairingCode: String
     private var signalingConnection: URLSessionWebSocketTask?
+    private var signalingSession: URLSession?  // Must retain session to keep WebSocket alive
     private var peerConnection: RTCPeerConnection?
     private var dataChannel: RTCDataChannel?
     private let syncStore: TetherlySyncStore
@@ -20,11 +21,20 @@ public class TetherlySDK: NSObject {
     private var isInitiator = false
     private var iceServers: [RTCIceServer] = []
     private var connectionTimeout: Timer?
+    private var connectingTimeout: Timer?  // Timeout for stuck "connecting" state
+    private var pingTimer: Timer?
+    private var reconnectTimer: Timer?
     private var isResetting = false
+    private var isConnecting = false  // Prevent concurrent connection attempts
+    private var reconnectAttempts = 0
     private static let connectionTimeoutSeconds: TimeInterval = 30.0
+    private static let connectingTimeoutSeconds: TimeInterval = 15.0  // Max time to stay in "connecting"
+    private static let pingIntervalSeconds: TimeInterval = 15.0
+    private static let maxReconnectAttempts = 10
+    private static let reconnectBaseDelay: TimeInterval = 0.5  // Start fast, then backoff
 
     // Default signaling server URL
-    private static let defaultSignalingUrl = "wss://fnzo0svi94.execute-api.us-east-1.amazonaws.com/prod"
+    private static let defaultSignalingUrl = "wss://itq5lu6nq9.execute-api.us-east-1.amazonaws.com/prod"
 
     private static let factory: RTCPeerConnectionFactory = {
         RTCInitializeSSL()
@@ -57,6 +67,10 @@ public class TetherlySDK: NSObject {
             guard let self = self else { return }
             self.delegate?.tetherly(self, didSyncUpdate: collection, record: record)
         }
+    }
+
+    deinit {
+        NSLog("[TetherlySDK] DEINIT - SDK is being deallocated!")
     }
 
     // MARK: - ICE Server Configuration
@@ -121,10 +135,152 @@ public class TetherlySDK: NSObject {
 
     public func disconnect() {
         clearConnectionTimeout()
+        clearConnectingTimeout()
+        stopPingTimer()
+        stopReconnectTimer()
+        reconnectAttempts = 0
         cleanupPeerConnection()
         signalingConnection?.cancel(with: .goingAway, reason: nil)
         signalingConnection = nil
         isSignalingConnected = false
+    }
+
+    /// Force reconnection - useful when app returns from background
+    public func reconnect() {
+        NSLog("[TetherlySDK] reconnect() called - forcing new connection")
+        reconnectAttempts = 0  // Reset counter for manual reconnect
+        stopReconnectTimer()
+
+        if !isSignalingConnected {
+            // Signaling is down, reconnect everything
+            NSLog("[TetherlySDK] Signaling down - reconnecting...")
+            connectToSignaling()
+        } else if !isConnected {
+            // Signaling is up but WebRTC is down
+            NSLog("[TetherlySDK] WebRTC down - requesting new connection...")
+            cleanupPeerConnection()
+            sendSignalingMessage(["type": "ready"])
+        } else {
+            NSLog("[TetherlySDK] Already connected - no reconnect needed")
+        }
+    }
+
+    /// Check connection health and reconnect if needed (call when app wakes/foregrounds)
+    public func checkConnectionHealth() {
+        NSLog("[TetherlySDK] Health check: signaling=\(isSignalingConnected), connected=\(isConnected), connecting=\(isConnecting)")
+
+        // Always verify WebSocket is actually alive with a ping
+        // iOS may have killed the connection while backgrounded
+        if let connection = signalingConnection {
+            NSLog("[TetherlySDK] Health check: verifying WebSocket with ping...")
+            connection.sendPing { [weak self] error in
+                guard let self = self else { return }
+                DispatchQueue.main.async {
+                    if let error = error {
+                        NSLog("[TetherlySDK] Health check: WebSocket dead (ping failed: \(error.localizedDescription))")
+                        // WebSocket is dead - force full reconnect
+                        self.isSignalingConnected = false
+                        self.isConnected = false
+                        self.signalingConnection?.cancel(with: .goingAway, reason: nil)
+                        self.signalingConnection = nil
+                        self.cleanupPeerConnection()
+                        self.reconnectAttempts = 0
+                        self.delegate?.tetherlyIsReconnecting(self)
+                        self.connectToSignaling()
+                    } else {
+                        NSLog("[TetherlySDK] Health check: WebSocket alive")
+                        // WebSocket is alive, check WebRTC
+                        if !self.isConnected {
+                            if self.isConnecting {
+                                NSLog("[TetherlySDK] Health check: already connecting, resetting to retry")
+                                self.isConnecting = false
+                                self.cleanupPeerConnection()
+                            }
+                            NSLog("[TetherlySDK] Health check: WebRTC disconnected, requesting new connection...")
+                            self.reconnectAttempts = 0
+                            self.requestNewConnection()
+                        } else {
+                            NSLog("[TetherlySDK] Health check: connection healthy")
+                        }
+                    }
+                }
+            }
+        } else {
+            NSLog("[TetherlySDK] Health check: no WebSocket connection, reconnecting...")
+            reconnectAttempts = 0
+            connect()
+        }
+    }
+
+    private func stopReconnectTimer() {
+        reconnectTimer?.invalidate()
+        reconnectTimer = nil
+    }
+
+    private func startConnectingTimeout() {
+        clearConnectingTimeout()
+        connectingTimeout = Timer.scheduledTimer(withTimeInterval: Self.connectingTimeoutSeconds, repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            if self.isConnecting && !self.isConnected {
+                NSLog("[TetherlySDK] Connecting timeout - stuck in connecting state, resetting")
+                self.isConnecting = false
+                self.cleanupPeerConnection()
+                // Notify delegate we're reconnecting
+                self.delegate?.tetherlyIsReconnecting(self)
+                self.requestNewConnection()
+            }
+        }
+    }
+
+    private func clearConnectingTimeout() {
+        connectingTimeout?.invalidate()
+        connectingTimeout = nil
+    }
+
+    /// Request a new WebRTC connection by sending 'ready' message
+    private func requestNewConnection() {
+        guard isSignalingConnected else {
+            NSLog("[TetherlySDK] Cannot request new connection - signaling not connected")
+            delegate?.tetherlyDidDisconnect(self)
+            return
+        }
+
+        guard reconnectAttempts < Self.maxReconnectAttempts else {
+            NSLog("[TetherlySDK] Max reconnect attempts (\(Self.maxReconnectAttempts)) reached - giving up")
+            delegate?.tetherlyDidDisconnect(self)
+            return
+        }
+
+        // Exponential backoff with jitter
+        let delay = Self.reconnectBaseDelay * pow(1.5, Double(reconnectAttempts)) + Double.random(in: 0...1)
+        reconnectAttempts += 1
+
+        NSLog("[TetherlySDK] Scheduling reconnect attempt \(reconnectAttempts) in \(String(format: "%.1f", delay))s")
+
+        stopReconnectTimer()
+        reconnectTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            guard !self.isConnected else {
+                NSLog("[TetherlySDK] Already connected - skipping reconnect")
+                self.reconnectAttempts = 0
+                return
+            }
+
+            NSLog("[TetherlySDK] Sending 'ready' to request new WebRTC connection")
+            self.sendSignalingMessage(["type": "ready"])
+        }
+    }
+
+    private func startPingTimer() {
+        stopPingTimer()
+        pingTimer = Timer.scheduledTimer(withTimeInterval: Self.pingIntervalSeconds, repeats: true) { [weak self] _ in
+            self?.sendSignalingMessage(["type": "ping"])
+        }
+    }
+
+    private func stopPingTimer() {
+        pingTimer?.invalidate()
+        pingTimer = nil
     }
 
     // MARK: - Messaging
@@ -179,6 +335,11 @@ public class TetherlySDK: NSObject {
         print("[TetherlySDK] Stopping audio capture")
     }
 
+    /// Cancel audio capture - discard buffer without sending (swipe-to-cancel)
+    public func cancelAudioCapture() {
+        print("[TetherlySDK] Cancelling audio capture (discarding buffer)")
+    }
+
     // MARK: - Private - Signaling
 
     private func connectToSignaling() {
@@ -189,74 +350,213 @@ public class TetherlySDK: NSObject {
             return
         }
 
-        NSLog("[TetherlySDK] Connecting to signaling: \(url.absoluteString)")
+        NSLog("[TetherlySDK] ========== CONNECTING TO SIGNALING ==========")
+        NSLog("[TetherlySDK] URL: \(url.absoluteString)")
+        NSLog("[TetherlySDK] Pairing code: \(pairingCode.prefix(20))...")
 
-        let session = URLSession(configuration: .default)
-        signalingConnection = session.webSocketTask(with: url)
+        // Use shared session - it's guaranteed to stay alive
+        signalingConnection = URLSession.shared.webSocketTask(with: url)
+        NSLog("[TetherlySDK] WebSocket task state BEFORE resume: \(signalingConnection?.state.rawValue ?? -1)")
         signalingConnection?.resume()
+        NSLog("[TetherlySDK] WebSocket task state AFTER resume: \(signalingConnection?.state.rawValue ?? -1)")
 
-        // IMPORTANT: Set up listener FIRST, then send ready
+        // Test WebSocket-level ping after a short delay to let connection establish
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self = self else { return }
+            NSLog("[TetherlySDK] Testing WebSocket ping after 1s delay...")
+            NSLog("[TetherlySDK] Connection state: \(self.signalingConnection?.state.rawValue ?? -1)")
+            self.signalingConnection?.sendPing { error in
+                if let error = error {
+                    NSLog("[TetherlySDK] WebSocket PING FAILED: \(error.localizedDescription)")
+                    NSLog("[TetherlySDK] Error type: \(type(of: error))")
+                    // Connection failed - schedule retry with backoff
+                    DispatchQueue.main.async {
+                        self.isSignalingConnected = false
+                        self.signalingConnection?.cancel(with: .goingAway, reason: nil)
+                        self.signalingConnection = nil
+
+                        // Schedule retry if under max attempts
+                        self.reconnectAttempts += 1
+                        if self.reconnectAttempts <= Self.maxReconnectAttempts {
+                            let delay = Self.reconnectBaseDelay * pow(1.5, Double(self.reconnectAttempts)) + Double.random(in: 0...1)
+                            NSLog("[TetherlySDK] Scheduling signaling reconnect attempt \(self.reconnectAttempts) in \(String(format: "%.1f", delay))s")
+                            self.delegate?.tetherlyIsReconnecting(self)
+                            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                                guard let self = self, !self.isSignalingConnected else { return }
+                                self.connectToSignaling()
+                            }
+                        } else {
+                            NSLog("[TetherlySDK] Max reconnect attempts reached - giving up")
+                            self.delegate?.tetherlyDidDisconnect(self)
+                        }
+                    }
+                } else {
+                    NSLog("[TetherlySDK] WebSocket PING SUCCEEDED!")
+                    self.isSignalingConnected = true
+                    self.reconnectAttempts = 0  // Reset on success
+                }
+            }
+        }
+
+        // Also check connection state after 5 seconds (fallback if ping check didn't trigger)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+            guard let self = self else { return }
+            NSLog("[TetherlySDK] 5s connection check: signaling=\(self.isSignalingConnected), connected=\(self.isConnected), attempts=\(self.reconnectAttempts)")
+            NSLog("[TetherlySDK] WebSocket state: \(self.signalingConnection?.state.rawValue ?? -1)")
+            if !self.isSignalingConnected && !self.isConnected && self.reconnectAttempts < Self.maxReconnectAttempts {
+                NSLog("[TetherlySDK] Connection stuck - retrying...")
+                self.signalingConnection?.cancel(with: .goingAway, reason: nil)
+                self.signalingConnection = nil
+                self.reconnectAttempts += 1
+                self.delegate?.tetherlyIsReconnecting(self)
+                self.connectToSignaling()
+            }
+        }
+
+        // Set up receive callback immediately
         receiveSignalingMessage()
         
-        // Send ready message
+        // Test connection with a ping first
+        sendSignalingMessage(["type": "ping"])
+        NSLog("[TetherlySDK] Sent test ping to verify connection")
+
+        // Send ready message to request a WebRTC connection
         sendSignalingMessage(["type": "ready"])
         NSLog("[TetherlySDK] Sent 'ready' message to signaling server")
     }
 
     private func receiveSignalingMessage() {
+        NSLog("[TetherlySDK] ========== SETTING UP RECEIVE ==========")
+        NSLog("[TetherlySDK] Connection object: \(String(describing: signalingConnection))")
+        NSLog("[TetherlySDK] Connection state: \(signalingConnection?.state.rawValue ?? -1)")
         signalingConnection?.receive { [weak self] result in
-            switch result {
-            case .success(let message):
-                if !(self?.isSignalingConnected ?? false) {
-                    self?.isSignalingConnected = true
-                    print("[TetherlySDK] Signaling connected")
+            // Move ALL processing to main thread to avoid threading issues
+            DispatchQueue.main.async {
+                NSLog("[TetherlySDK] Receive callback fired on main thread")
+                guard let self = self else {
+                    NSLog("[TetherlySDK] self is nil in receive callback")
+                    return
                 }
 
-                switch message {
-                case .string(let text):
-                    self?.handleSignalingMessage(text)
-                case .data(let data):
-                    if let text = String(data: data, encoding: .utf8) {
-                        self?.handleSignalingMessage(text)
+                switch result {
+                case .success(let message):
+                    NSLog("[TetherlySDK] Received message successfully!")
+                    let wasSignalingConnected = self.isSignalingConnected
+                    if !wasSignalingConnected {
+                        self.isSignalingConnected = true
+                        NSLog("[TetherlySDK] Signaling connected (first message)")
+                        self.startPingTimer()
+
+                        // If WebRTC is not connected, request a new connection
+                        if !self.isConnected && self.peerConnection == nil {
+                            NSLog("[TetherlySDK] Signaling reconnected but no WebRTC - sending ready")
+                            self.sendSignalingMessage(["type": "ready"])
+                        }
                     }
-                @unknown default:
-                    break
-                }
-                self?.receiveSignalingMessage()
 
-            case .failure(let error):
-                print("[TetherlySDK] Signaling error: \(error.localizedDescription)")
+                    switch message {
+                    case .string(let text):
+                        self.handleSignalingMessage(text)
+                    case .data(let data):
+                        if let text = String(data: data, encoding: .utf8) {
+                            self.handleSignalingMessage(text)
+                        }
+                    @unknown default:
+                        break
+                    }
+                    self.receiveSignalingMessage()
+
+                case .failure(let error):
+                    NSLog("[TetherlySDK] Signaling RECEIVE ERROR: \(error.localizedDescription)")
+                    NSLog("[TetherlySDK] Error details: \(error)")
+                    let wasSignalingConnected = self.isSignalingConnected
+                    let wasWebRTCConnected = self.isConnected
+                    self.isSignalingConnected = false
+                    self.isConnected = false
+                    self.stopPingTimer()
+                    self.stopReconnectTimer()
+
+                    // Also clean up WebRTC if signaling dies
+                    if wasSignalingConnected {
+                        self.cleanupPeerConnection()
+                    }
+
+                    // Notify that we're reconnecting (not disconnected - we'll auto-reconnect)
+                    if wasWebRTCConnected {
+                        self.delegate?.tetherlyIsReconnecting(self)
+                    }
+
+                    // Schedule reconnect after 2 seconds
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                        guard let self = self else { return }
+                        // Only reconnect if not already connected
+                        if !self.isSignalingConnected {
+                            NSLog("[TetherlySDK] Attempting signaling reconnect...")
+                            self.reconnectAttempts = 0  // Reset for fresh reconnect
+                            self.connectToSignaling()
+                        }
+                    }
+                }
             }
         }
     }
 
     private func handleSignalingMessage(_ message: String) {
+        // Log ALL raw signaling messages for debugging
+        NSLog("[TetherlySDK] RAW signaling message: \(message)")
+
         guard let data = message.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let type = json["type"] as? String else { return }
+              let type = json["type"] as? String else {
+            NSLog("[TetherlySDK] ERROR: Failed to parse signaling message")
+            return
+        }
 
         let payload = json["payload"] as? [String: Any]
 
-        print("[TetherlySDK] Signaling message: \(type)")
+        // Log all messages except pong
+        if type != "pong" {
+            NSLog("[TetherlySDK] Signaling message: \(type), json keys: \(json.keys)")
+        }
 
         DispatchQueue.main.async {
             switch type {
+            case "pong":
+                // Ping response - connection is healthy
+                break
+
             case "peer-joined":
-                if self.isConnected && self.dataChannel?.readyState == .open {
-                    print("[TetherlySDK] Ignoring peer-joined - already connected")
+                NSLog("[TetherlySDK] PEER-JOINED received!")
+
+                // Prevent concurrent connection attempts
+                if self.isConnecting {
+                    NSLog("[TetherlySDK] Ignoring peer-joined - already connecting")
                     return
                 }
+
+                NSLog("[TetherlySDK] isConnected: \(self.isConnected), dataChannel: \(String(describing: self.dataChannel)), readyState: \(self.dataChannel?.readyState.rawValue ?? -1)")
+                if self.isConnected && self.dataChannel?.readyState == .open {
+                    NSLog("[TetherlySDK] Ignoring peer-joined - already connected")
+                    return
+                }
+
+                // Mark as connecting to prevent race conditions
+                self.isConnecting = true
+                self.startConnectingTimeout()  // Fail-safe for stuck connecting state
+
                 // isInitiator can be at top level or in payload depending on signaling server version
-                let isInitiator = (json["isInitiator"] as? Bool) ?? (payload?["isInitiator"] as? Bool) ?? false
-                print("[TetherlySDK] Peer joined, isInitiator: \(isInitiator)")
+                let topLevelInitiator = json["isInitiator"] as? Bool
+                let payloadInitiator = payload?["isInitiator"] as? Bool
+                let isInitiator = topLevelInitiator ?? payloadInitiator ?? false
+                NSLog("[TetherlySDK] Peer joined - isInitiator: \(isInitiator), starting connection...")
                 self.cleanupPeerConnection()
                 self.createPeerConnection()
                 self.startConnectionTimeout()
                 if isInitiator {
-                    print("[TetherlySDK] Creating offer (we are initiator)")
+                    NSLog("[TetherlySDK] Creating offer (we are initiator)")
                     self.createOffer()
                 } else {
-                    print("[TetherlySDK] Waiting for offer (peer is initiator)")
+                    NSLog("[TetherlySDK] Waiting for offer (peer is initiator)")
                 }
 
             case "sdp-offer":
@@ -277,7 +577,7 @@ public class TetherlySDK: NSObject {
                 }
 
             case "turn-config":
-                print("[TetherlySDK] Received TURN config from Mac")
+                NSLog("[TetherlySDK] Received TURN config from Mac")
                 if let servers = payload?["servers"] as? [[String: Any]] {
                     self.addTurnServersFromMac(servers)
                 }
@@ -290,14 +590,44 @@ public class TetherlySDK: NSObject {
 
     private func sendSignalingMessage(_ message: [String: Any]) {
         guard let data = try? JSONSerialization.data(withJSONObject: message),
-              let string = String(data: data, encoding: .utf8) else { 
+              let string = String(data: data, encoding: .utf8) else {
             NSLog("[TetherlySDK] ERROR: Failed to serialize signaling message")
-            return 
+            return
         }
-        NSLog("[TetherlySDK] Sending signaling message: \(message["type"] ?? "unknown")")
-        signalingConnection?.send(.string(string)) { error in
+
+        // Check connection state
+        if signalingConnection == nil {
+            NSLog("[TetherlySDK] ERROR: signalingConnection is nil!")
+            return
+        }
+        let state = signalingConnection!.state
+        NSLog("[TetherlySDK] Sending \(message["type"] ?? "unknown"), connection state: \(state.rawValue)")
+
+        signalingConnection?.send(.string(string)) { [weak self] error in
             if let error = error {
-                print("[TetherlySDK] Failed to send signaling: \(error)")
+                NSLog("[TetherlySDK] SEND ERROR: \(error.localizedDescription)")
+                // Send failed - WebSocket is likely dead, trigger reconnect
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    if self.isSignalingConnected {
+                        NSLog("[TetherlySDK] Send failed - marking signaling as disconnected and reconnecting")
+                        self.isSignalingConnected = false
+                        self.isConnected = false
+                        self.stopPingTimer()
+                        self.cleanupPeerConnection()
+                        self.signalingConnection?.cancel(with: .goingAway, reason: nil)
+                        self.signalingConnection = nil
+                        self.delegate?.tetherlyIsReconnecting(self)
+                        // Reconnect after a short delay
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                            guard let self = self, !self.isSignalingConnected else { return }
+                            self.reconnectAttempts = 0
+                            self.connectToSignaling()
+                        }
+                    }
+                }
+            } else {
+                NSLog("[TetherlySDK] Message sent successfully: \(message["type"] ?? "unknown")")
             }
         }
     }
@@ -349,18 +679,20 @@ public class TetherlySDK: NSObject {
     }
 
     private func createOffer() {
+        NSLog("[TetherlySDK] createOffer() called")
         guard let pc = peerConnection else {
-            print("[TetherlySDK] ERROR: No peer connection for createOffer")
+            NSLog("[TetherlySDK] ERROR: No peer connection for createOffer")
             return
         }
-        
+        NSLog("[TetherlySDK] Have peer connection, creating data channel...")
+
         // Create data channel before creating offer
         let config = RTCDataChannelConfiguration()
         config.isOrdered = true
         config.channelId = 0
         dataChannel = pc.dataChannel(forLabel: "tetherly", configuration: config)
         dataChannel?.delegate = self
-        print("[TetherlySDK] Data channel created")
+        NSLog("[TetherlySDK] Data channel created")
         
         let constraints = RTCMediaConstraints(
             mandatoryConstraints: [
@@ -476,6 +808,7 @@ public class TetherlySDK: NSObject {
         peerConnection?.close()
         peerConnection = nil
         isConnected = false
+        isConnecting = false
         pendingCandidates.removeAll()
     }
 
@@ -498,15 +831,36 @@ extension TetherlySDK: RTCPeerConnectionDelegate {
     public func peerConnectionShouldNegotiate(_ peerConnection: RTCPeerConnection) {}
 
     public func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceConnectionState) {
+        NSLog("[TetherlySDK] ICE connection state changed: \(newState.rawValue)")
         DispatchQueue.main.async {
             switch newState {
             case .connected, .completed:
+                NSLog("[TetherlySDK] ICE CONNECTED")
+                self.clearConnectionTimeout()
+                self.clearConnectingTimeout()
+                self.stopReconnectTimer()
+                self.reconnectAttempts = 0  // Reset on successful connection
+                self.isConnecting = false   // Connection attempt complete
                 self.isConnected = true
                 self.delegate?.tetherlyDidConnect(self)
                 self.syncStore.requestSync()
-            case .failed, .closed:
-                if self.isConnected {
-                    self.isConnected = false
+            case .failed, .closed, .disconnected:
+                NSLog("[TetherlySDK] ICE \(newState.rawValue), isConnected was: \(self.isConnected)")
+                let wasConnected = self.isConnected
+                self.isConnecting = false  // Connection attempt complete (failed)
+                self.isConnected = false
+                // Clean up the old peer connection
+                self.cleanupPeerConnection()
+                // Automatically request a new connection if signaling is still up
+                if self.isSignalingConnected {
+                    NSLog("[TetherlySDK] Signaling still connected - requesting new WebRTC connection")
+                    // Notify delegate we're reconnecting (not disconnected)
+                    if wasConnected {
+                        self.delegate?.tetherlyIsReconnecting(self)
+                    }
+                    self.requestNewConnection()
+                } else if wasConnected {
+                    // Only notify disconnect if we can't auto-reconnect
                     self.delegate?.tetherlyDidDisconnect(self)
                 }
             default:
@@ -540,15 +894,35 @@ extension TetherlySDK: RTCPeerConnectionDelegate {
 
 extension TetherlySDK: RTCDataChannelDelegate {
     public func dataChannelDidChangeState(_ dataChannel: RTCDataChannel) {
+        NSLog("[TetherlySDK] Data channel state changed: \(dataChannel.readyState.rawValue)")
         DispatchQueue.main.async {
             if dataChannel.readyState == .open {
+                NSLog("[TetherlySDK] Data channel open - connection complete")
+                self.clearConnectionTimeout()
+                self.clearConnectingTimeout()
+                self.stopReconnectTimer()
+                self.reconnectAttempts = 0  // Reset on successful connection
+                self.isConnecting = false
                 self.isConnected = true
                 self.delegate?.tetherlyDidConnect(self)
                 self.syncStore.requestSync()
-            } else if dataChannel.readyState == .closed {
-                if self.isConnected {
+            } else if dataChannel.readyState == .closed || dataChannel.readyState == .closing {
+                NSLog("[TetherlySDK] Data channel closed/closing, isConnected was: \(self.isConnected)")
+                let wasConnected = self.isConnected
+                if wasConnected {
                     self.isConnected = false
-                    self.delegate?.tetherlyDidDisconnect(self)
+
+                    // Data channel closed - cleanup and request new connection
+                    NSLog("[TetherlySDK] Data channel closed while connected - triggering reconnect")
+                    self.cleanupPeerConnection()
+                    if self.isSignalingConnected {
+                        // Notify delegate we're reconnecting (not disconnected)
+                        self.delegate?.tetherlyIsReconnecting(self)
+                        self.requestNewConnection()
+                    } else {
+                        // Only notify disconnect if we can't auto-reconnect
+                        self.delegate?.tetherlyDidDisconnect(self)
+                    }
                 }
             }
         }

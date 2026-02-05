@@ -119,6 +119,7 @@ public struct AnyCodable: Codable {
 public protocol TetherlySDKDelegate: AnyObject {
     func tetherlyDidConnect(_ sdk: TetherlySDK)
     func tetherlyDidDisconnect(_ sdk: TetherlySDK)
+    func tetherlyIsReconnecting(_ sdk: TetherlySDK)
     func tetherly(_ sdk: TetherlySDK, didReceiveMessage message: TetherlyMessage)
     func tetherly(_ sdk: TetherlySDK, didReceiveMedia media: MediaMessage)
     func tetherly(_ sdk: TetherlySDK, didSyncUpdate collection: String, record: SyncRecord)
@@ -128,6 +129,7 @@ public protocol TetherlySDKDelegate: AnyObject {
 public extension TetherlySDKDelegate {
     func tetherlyDidConnect(_ sdk: TetherlySDK) {}
     func tetherlyDidDisconnect(_ sdk: TetherlySDK) {}
+    func tetherlyIsReconnecting(_ sdk: TetherlySDK) {}
     func tetherly(_ sdk: TetherlySDK, didReceiveMessage message: TetherlyMessage) {}
     func tetherly(_ sdk: TetherlySDK, didReceiveMedia media: MediaMessage) {}
     func tetherly(_ sdk: TetherlySDK, didSyncUpdate collection: String, record: SyncRecord) {}

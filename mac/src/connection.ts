@@ -89,8 +89,8 @@ export class Connection {
   private lastPeerActivity = Date.now();
   private isResetting = false;
   private lastTurnServers: { urls: string; username: string; credential: string }[] = [];
-  private static readonly HEALTH_CHECK_INTERVAL_MS = 10000;  // Check every 10s
-  private static readonly PEER_TIMEOUT_MS = 120000;  // Consider dead after 2 min no activity
+  private static readonly HEALTH_CHECK_INTERVAL_MS = 30000;  // Check every 30s
+  private static readonly PEER_TIMEOUT_MS = 600000;  // Consider dead after 10 min no activity
   private static readonly CONNECTION_TIMEOUT_MS = 30000;  // 30s to establish connection
 
   constructor(config: ConnectionConfig, events: TetherlyEvents) {
@@ -203,6 +203,7 @@ export class Connection {
 
   send(message: Message): void {
     if (this.dataChannel?.readyState === 'open') {
+      this.markPeerActivity();  // Mark activity on send too
       this.dataChannel.send(JSON.stringify(message));
     }
   }
@@ -213,6 +214,7 @@ export class Connection {
 
   sendRaw(data: string): void {
     if (this.dataChannel?.readyState === 'open') {
+      this.markPeerActivity();  // Mark activity on send too
       this.dataChannel.send(data);
     }
   }
@@ -462,6 +464,7 @@ export class Connection {
       this.clearConnectionTimeout();
       this._isConnected = true;
       this.isResetting = false;
+      this.markPeerActivity();  // Mark activity when channel opens
       this.events.onConnected?.();
     };
 
